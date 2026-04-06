@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 import time
 import uuid
+import re
+import csv
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -137,6 +139,7 @@ class SessionState:
 
     # ── Identity ────────────────────────────────────────────────────────────
     session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    dataset_id: str = field(default_factory=lambda: time.strftime("%Y%m%d_%H%M%S"))
 
     # ── What the user wants ─────────────────────────────────────────────────
     topic: str = ""                         # e.g. "antibody drug conjugates approved by FDA"
@@ -179,6 +182,12 @@ class SessionState:
     # ── Misc ─────────────────────────────────────────────────────────────────
     created_at: float = field(default_factory=time.time)
     last_saved: float = 0.0
+    dataset_dir: str = ""
+    pdf_dir: str = ""
+    tables_dir: str = ""
+    images_dir: str = ""
+    supplementary_dir: str = ""
+    live_csv_path: str = ""
 
     # ── Convenience methods ──────────────────────────────────────────────────
 
@@ -189,6 +198,19 @@ class SessionState:
     def add_row(self, row: ExtractedRow) -> None:
         """Append an extracted row."""
         self.rows.append(row)
+        # Best-effort live append so users can observe progress in realtime.
+        if self.live_csv_path:
+            try:
+                with open(self.live_csv_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        int(time.time()),
+                        row.source_url,
+                        json.dumps(row.data, ensure_ascii=False),
+                    ])
+            except Exception:
+                # Do not block extraction if live-write fails.
+                pass
 
     def mark_processed(self, url: str) -> None:
         """Move a URL from pending to processed."""
@@ -222,6 +244,34 @@ class SessionState:
             f"{len(self.processed_sources)} sources processed"
         )
 
+    def ensure_dataset_dirs(self) -> None:
+        """
+        Create a per-run dataset folder and subfolders for extracted artifacts.
+        Safe to call repeatedly.
+        """
+        if self.dataset_dir:
+            return
+
+        topic_slug = re.sub(r"[^a-zA-Z0-9]+", "_", (self.topic or "dataset")).strip("_").lower()
+        topic_slug = topic_slug[:80] or "dataset"
+        base_name = f"{self.dataset_id}_{topic_slug}"
+        dataset_root = Path(cfg.OUTPUT_DIR) / base_name
+
+        self.dataset_dir = str(dataset_root)
+        self.pdf_dir = str(dataset_root / "pdfs")
+        self.tables_dir = str(dataset_root / "tables")
+        self.images_dir = str(dataset_root / "images")
+        self.supplementary_dir = str(dataset_root / "supplementary")
+        self.live_csv_path = str(dataset_root / "live_rows.csv")
+
+        for d in [self.dataset_dir, self.pdf_dir, self.tables_dir, self.images_dir, self.supplementary_dir]:
+            Path(d).mkdir(parents=True, exist_ok=True)
+
+        # Initialize live CSV file once
+        live_csv = Path(self.live_csv_path)
+        if not live_csv.exists():
+            live_csv.write_text("timestamp,source_url,row_json\n", encoding="utf-8")
+
     # ── Persistence ──────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
@@ -239,6 +289,13 @@ class SessionState:
                 for c in self.columns
             ],
             "source_limit": self.source_limit,
+            "dataset_id": self.dataset_id,
+            "dataset_dir": self.dataset_dir,
+            "pdf_dir": self.pdf_dir,
+            "tables_dir": self.tables_dir,
+            "images_dir": self.images_dir,
+            "supplementary_dir": self.supplementary_dir,
+            "live_csv_path": self.live_csv_path,
             "pending_sources": self.pending_sources,
             "processed_sources": list(self.processed_sources),
             "dead_sources": list(self.dead_sources),
@@ -268,6 +325,13 @@ class SessionState:
             ColumnDef(**col) for col in d.get("columns", [])
         ]
         s.source_limit = d.get("source_limit", cfg.DEFAULT_SOURCE_LIMIT)
+        s.dataset_id = d.get("dataset_id", s.dataset_id)
+        s.dataset_dir = d.get("dataset_dir", "")
+        s.pdf_dir = d.get("pdf_dir", "")
+        s.tables_dir = d.get("tables_dir", "")
+        s.images_dir = d.get("images_dir", "")
+        s.supplementary_dir = d.get("supplementary_dir", "")
+        s.live_csv_path = d.get("live_csv_path", "")
         s.pending_sources = d.get("pending_sources", [])
         s.processed_sources = set(d.get("processed_sources", []))
         s.dead_sources = set(d.get("dead_sources", []))
