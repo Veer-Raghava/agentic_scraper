@@ -18,7 +18,8 @@ Create a `.env` file:
 
 ```bash
 cat > .env <<'ENV'
-OPENAI_API_KEY=sk-api-key-urs
+OPENAI_API_KEY=sk-your-key-here
+ENV
 ```
 
 Run the app:

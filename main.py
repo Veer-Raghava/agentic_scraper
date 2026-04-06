@@ -24,9 +24,6 @@ Architecture overview:
          SessionState (state.py) — shared truth
 """
 
-import nest_asyncio
-nest_asyncio.apply()
-
 import argparse
 import sys
 from pathlib import Path
@@ -61,7 +58,7 @@ BANNER = """[bold cyan]
 
 # ── Prompt styling ────────────────────────────────────────────────────────────
 _PROMPT_STYLE = Style.from_dict({
-    "prompt": "bold cyan",
+    "prompt": "bold bright_cyan",
 })
 
 
@@ -146,7 +143,8 @@ def run_chat_loop(orchestrator: Orchestrator, state: SessionState) -> None:
 
     # Print greeting
     greeting = orchestrator.greet()
-    console.print(Panel(greeting, border_style="cyan", title="ARIA"))
+    console.print(Panel(greeting, border_style="bright_blue", title="🤖 ARIA", subtitle="interactive mode"))
+    console.print(Rule("[bold cyan]Live session started[/bold cyan]", style="cyan"))
 
     while True:
         try:
@@ -169,6 +167,7 @@ def run_chat_loop(orchestrator: Orchestrator, state: SessionState) -> None:
 
         # ── Route to orchestrator ────────────────────────────────────────────
         console.print()  # breathing room before response
+        console.print(Rule("[dim]processing[/dim]", style="dim"))
         try:
             response = orchestrator.handle(user_input)
         except KeyboardInterrupt:
@@ -184,7 +183,7 @@ def run_chat_loop(orchestrator: Orchestrator, state: SessionState) -> None:
 
         # ── Print response ────────────────────────────────────────────────────
         console.print(Rule(style="dim"))
-        console.print(f"[bold]ARIA[/bold] ❯  {response}")
+        console.print(Panel(f"{response}", title="[bold cyan]ARIA[/bold cyan]", border_style="cyan"))
 
         # ── Auto-save on every turn ───────────────────────────────────────────
         if state.rows:

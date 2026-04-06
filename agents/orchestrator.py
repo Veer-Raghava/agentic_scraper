@@ -36,10 +36,12 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 from ddgs import DDGS
 from rich.console import Console
+from rich.box import ROUNDED
 from rich.panel import Panel
 from rich.table import Table
 
@@ -53,6 +55,7 @@ from state import ColumnDef, SessionState
 from tools.browser import BrowserPool
 from tools.export import print_fill_report, print_preview, save_csv, save_xlsx
 from tools.llm_tools import LLMClient
+from tools.pdf_tools import download_pdf, extract_pdf_artifacts, is_pdf_url
 
 console = Console()
 
@@ -180,7 +183,8 @@ class Orchestrator:
 
     def _live_status(self, message: str) -> None:
         """Print a timestamped live status line in the CLI."""
-        console.print(f"[bold cyan]⏱[/bold cyan] [dim]{message}[/dim]")
+        ts = datetime.now().strftime("%H:%M:%S")
+        console.print(f"[bold cyan]⏱ {ts}[/bold cyan] [white]{message}[/white]")
 
     def _render_pipeline_status(self) -> None:
         """Render a compact status table for current pipeline state."""
@@ -190,13 +194,29 @@ class Orchestrator:
             "done": "✓",
             "failed": "✗",
         }
-        table = Table(title="Pipeline Status", show_header=True, header_style="bold cyan")
+        color = {
+            "pending": "dim",
+            "running": "bold yellow",
+            "done": "bold green",
+            "failed": "bold red",
+        }
+        table = Table(
+            title="🚦 Pipeline Status",
+            show_header=True,
+            header_style="bold cyan",
+            box=ROUNDED,
+            expand=True,
+        )
         table.add_column("Stage", style="bold")
         table.add_column("State")
         table.add_column("Details", overflow="fold")
         for stage in self._stage_order:
             state, details = self._stage_state.get(stage, ("pending", ""))
-            table.add_row(stage, f"{icon.get(state, '○')} {state}", details)
+            table.add_row(
+                stage,
+                f"[{color.get(state, 'white')}]{icon.get(state, '○')} {state}[/{color.get(state, 'white')}]",
+                details or "—",
+            )
         console.print(table)
 
     def _set_stage(self, stage: str, state: str, details: str = "") -> None:
@@ -289,20 +309,37 @@ class Orchestrator:
         if user_message.strip().lower() in ("help", "/help"):
             return self._help_text()
 
-        # Parse intent
-        intent = self._parse_intent(user_message)
-         # If we're waiting for column confirmation, prioritize that flow.
-        # This avoids LLM intent misclassification loops (e.g. "go" treated as
-        # a brand new topic instead of confirming suggested columns).
-        if self._awaiting_column_confirmation and self._should_force_column_confirm(user_message, intent):
-            intent = {"intent": "confirm_columns"}
-
+        # Parse intent (fast deterministic parser first, LLM fallback second).
+        intent = self._fast_parse_intent(user_message) or self._parse_intent(user_message)
 
         # If we're waiting for column confirmation, prioritize that flow.
         # This avoids LLM intent misclassification loops (e.g. "go" treated as
         # a brand new topic instead of confirming suggested columns).
         if self._awaiting_column_confirmation and self._should_force_column_confirm(user_message, intent):
             intent = {"intent": "confirm_columns"}
+
+        # If topic/columns are already set but extraction has not yet run,
+        # treat lightweight acknowledgements as an explicit "start now".
+        if (
+            not self._awaiting_column_confirmation
+            and self.state.topic
+            and self.state.columns
+            and not self.state.rows
+            and (intent.get("intent") in {"chat", "question"})
+            and user_message.strip().lower() in {
+                "go", "go ahead", "start", "ok", "okay", "yes", "yeah",
+                "anything works", "no, anything works", "no anything works",
+            }
+        ):
+            intent = {"intent": "confirm_columns"}
+
+        # Prevent accidental topic overwrite from vague prompts once a topic is active.
+        if (
+            intent.get("intent") == "start_pipeline"
+            and self.state.topic
+            and not any(k in user_message.lower() for k in ("new topic", "change topic", "start over"))
+        ):
+            intent = {"intent": "more_sources", "source_limit": 5}
 
         if cfg.DEBUG:
             console.print(f"[dim]Intent: {json.dumps(intent, indent=2)}[/dim]")
@@ -331,31 +368,62 @@ class Orchestrator:
 
         self.state.add_message("assistant", response)
         return response
-    def _should_force_column_confirm(self, message: str, intent: dict) -> bool:
-        """Return True when input should be treated as column confirmation."""
-        text = (message or "").strip().lower()
-        parsed_intent = (intent or {}).get("intent", "")
 
-        # Allow explicit control intents to pass through.
-        if parsed_intent in {"stop", "change_topic"}:
-            return False
-
-        # Strong confirmation signals.
-        if text in {"go", "yes", "ok", "all", "use all", "y"}:
-            return True
-        if re.match(r"^[\d,\s]+$", text):
-            return True
-        if text.startswith("use:") or text.startswith("use "):
-            return True
-        if text.startswith("add "):
-            return True
-
-        # In pending-confirmation mode, default to confirmation unless user is
-        # clearly asking for a new topic.
-        if any(phrase in text for phrase in ("new topic", "change topic", "start over", "different topic")):
-            return False
-        return True
     # ── Intent parsing ──────────────────────────────────────────────────────
+
+    def _fast_parse_intent(self, message: str) -> dict | None:
+        """
+        Deterministic parser for high-confidence intents.
+        Reduces LLM token usage and prevents chat-loop hallucinations.
+        """
+        text = (message or "").strip()
+        low = text.lower()
+        if not text:
+            return {"intent": "chat"}
+        if low in {"stop", "exit", "quit", "q", ":q"}:
+            return {"intent": "stop"}
+        if any(k in low for k in ("show results", "show fill", "fill report", "preview")):
+            return {"intent": "show_results"}
+        if any(k in low for k in ("export csv", "export xlsx", "save csv", "save xlsx")):
+            return {"intent": "export", "export_format": "xlsx" if "xlsx" in low else "csv"}
+        if re.search(r"\bfind more|get \d+ more|more sources\b", low):
+            m = re.search(r"(\d+)", low)
+            return {"intent": "more_sources", "source_limit": int(m.group(1)) if m else None}
+        if re.search(r"\bfix row\b", low):
+            m = re.search(r"(\d+)", low)
+            return {"intent": "fix_row", "row_index": int(m.group(1)) if m else None}
+        if low.startswith("add column") or low.startswith("add "):
+            return {"intent": "add_column"}
+        if "http://" in low or "https://" in low:
+            return {"intent": "custom_urls"}
+        if ".pdf" in low:
+            return {"intent": "local_pdfs"}
+
+        # Strong start-pipeline heuristic with optional inline columns.
+        if any(k in low for k in ("research", "collect data", "scrape", "dataset", "anti body", "antibody", "adc")):
+            cols = self._extract_columns_from_text(text)
+            return {"intent": "start_pipeline", "topic": text, "columns": cols or None}
+
+        # Explicit column confirmation forms.
+        if re.match(r"^[\d,\s]+$", low) or low.startswith("use:") or low.startswith("use "):
+            return {"intent": "confirm_columns"}
+        if low in {"go", "yes", "ok", "all", "use all", "y"}:
+            return {"intent": "confirm_columns"}
+        return None
+
+    @staticmethod
+    def _extract_columns_from_text(text: str) -> list[str]:
+        """Best-effort extraction of comma-separated column names from free text."""
+        low = text.lower()
+        m = re.search(r"(?:columns?|fields?)\s*[:\-]?\s*(.+)$", low, re.I)
+        if not m:
+            return []
+        raw = m.group(1)
+        # trim trailing conversational tails
+        raw = re.split(r"\b(please|thanks|thank you)\b", raw)[0]
+        names = [n.strip(" .").title() for n in raw.split(",") if n.strip()]
+        # keep sane names only
+        return [n for n in names if 1 < len(n) <= 50][:20]
 
     def _should_force_column_confirm(self, message: str, intent: dict) -> bool:
         """Return True when input should be treated as column confirmation."""
@@ -465,6 +533,9 @@ class Orchestrator:
         Parses 'go', '1,3,5', 'use: X, Y, Z', etc.
         """
         if not self._awaiting_column_confirmation:
+            # If columns are already fixed and user confirms "go/start", begin pipeline.
+            if self.state.topic and self.state.columns:
+                return self._run_pipeline()
             return self._handle_chat(raw_message)
 
         pending = self.state.pending_column_defs
@@ -473,6 +544,15 @@ class Orchestrator:
         # "go" / "yes" / "ok" → use all suggestions
         if msg in ("go", "yes", "ok", "all", "use all", "y"):
             selected = pending
+
+        # Mixed selection: "1,2,10, add linker,payload"
+        elif "add " in msg and re.search(r"\d", msg):
+            nums = re.findall(r"\d+", msg)
+            indices = [int(x) - 1 for x in nums]
+            chosen = [pending[i] for i in indices if 0 <= i < len(pending)]
+            add_part = msg.split("add", 1)[1].strip()
+            extras = [ColumnDef(name=n.strip().title()) for n in add_part.split(",") if n.strip()]
+            selected = chosen + extras
 
         # Numeric selection: "1,3,5"
         elif re.match(r'^[\d,\s]+$', msg):
@@ -513,6 +593,7 @@ class Orchestrator:
         Returns a summary message for the chat.
         """
         self.state.pipeline_running = True
+        self.state.ensure_dataset_dirs()
         self._live_status("Pipeline started")
         self._stage_state = {s: ("pending", "") for s in self._stage_order}
         console.print(Panel.fit(
@@ -559,6 +640,29 @@ class Orchestrator:
                 "Try rephrasing the topic or providing specific URLs."
             )
 
+        # 1.5 PDF prefetch (download + parse artifacts) so files are always
+        # available locally per dataset run.
+        pdf_urls = [u for u in self.state.pending_sources if is_pdf_url(u)]
+        if pdf_urls:
+            self._live_status(f"Prefetching PDF artifacts locally ({len(pdf_urls)} URL candidates)")
+            downloaded = 0
+            for url in pdf_urls[: self.state.source_limit * 3]:
+                local_pdf = download_pdf(url, self.state.pdf_dir)
+                if not local_pdf:
+                    continue
+                downloaded += 1
+                meta = extract_pdf_artifacts(
+                    local_pdf,
+                    tables_dir=self.state.tables_dir,
+                    images_dir=self.state.images_dir,
+                    supplementary_dir=self.state.supplementary_dir,
+                )
+                self._live_status(
+                    f"PDF saved: {local_pdf.split('/')[-1]} | "
+                    f"tables={len(meta.get('tables', []))}, images={len(meta.get('images', []))}"
+                )
+            self._live_status(f"PDF prefetch completed. Downloaded: {downloaded}")
+
         # 2. Scrape
         self._live_status(f"Scraping up to {self.state.source_limit} source(s)")
         self._set_stage("Scrape", "running", f"Limit: {self.state.source_limit}")
@@ -588,20 +692,25 @@ class Orchestrator:
 
         # 4. Critic + Refine (if we have rows and haven't exceeded limits)
         if self.state.rows and self.state.refinement_rounds < cfg.MAX_REFINEMENT_ROUNDS:
-            self._live_status("Running critic pass")
-            self._set_stage("Critic", "running", f"Rows: {len(self.state.rows)}")
-            assessments = self.critic_agent.run(self.state)
-            if any(a.needs_refinement for a in assessments):
-                self._live_status("Refining missing/low-confidence fields")
-                self._set_stage("Critic", "done", "Needs refinement")
-                self._set_stage("Refine", "running", "Filling gaps")
-                self.refiner_agent.run(assessments, self.state)
-                self._live_status("Refinement finished")
-                self._set_stage("Refine", "done", "Gap fill completed")
-            else:
-                self._live_status("Critic finished. No refinement needed")
-                self._set_stage("Critic", "done", "No refinement needed")
-                self._set_stage("Refine", "done", "Skipped")
+            try:
+                self._live_status("Running critic pass")
+                self._set_stage("Critic", "running", f"Rows: {len(self.state.rows)}")
+                assessments = self.critic_agent.run(self.state)
+                if any(a.needs_refinement for a in assessments):
+                    self._live_status("Refining missing/low-confidence fields")
+                    self._set_stage("Critic", "done", "Needs refinement")
+                    self._set_stage("Refine", "running", "Filling gaps")
+                    self.refiner_agent.run(assessments, self.state)
+                    self._live_status("Refinement finished")
+                    self._set_stage("Refine", "done", "Gap fill completed")
+                else:
+                    self._live_status("Critic finished. No refinement needed")
+                    self._set_stage("Critic", "done", "No refinement needed")
+                    self._set_stage("Refine", "done", "Skipped")
+            except Exception as exc:
+                self._live_status(f"Refinement stage error (continuing): {exc}")
+                self._set_stage("Critic", "failed", "Error during critic/refiner")
+                self._set_stage("Refine", "failed", "Skipped due to error")
 
         # 5. Export
         self._live_status("Saving CSV and rendering preview")
@@ -621,6 +730,8 @@ class Orchestrator:
             f"{len(self.state.processed_sources)} sources.\n"
             f"Average field fill rate: **{avg_fill:.0%}**\n"
             f"Saved to: `{csv_path}`\n\n"
+            f"Dataset folder: `{self.state.dataset_dir}`\n"
+            f"PDFs: `{self.state.pdf_dir}` | Tables: `{self.state.tables_dir}` | Images: `{self.state.images_dir}`\n\n"
             f"What next? You can:\n"
             f"  • 'find more sources' — process more URLs\n"
             f"  • 'add column X' — extract a new field\n"
@@ -869,6 +980,20 @@ class Orchestrator:
         """
         Handle general questions and conversation using the full history.
         """
+        low = (user_message or "").strip().lower()
+        if self.state.pipeline_running:
+            return (
+                "Pipeline is currently running. Watch live status above. "
+                "I will print results as soon as this run completes."
+            )
+        if self.state.topic and self.state.columns and not self.state.rows:
+            return (
+                "Ready to run with current topic/columns. "
+                "Type 'go' to start now, or 'change topic ...' to reset."
+            )
+        if low in {"no", "nope", "anything works", "no, anything works"}:
+            return "Got it — using default strategy. Type 'go' to start."
+
         # Build message history for multi-turn context
         history = [
             {"role": m.role, "content": m.content[:800]}
