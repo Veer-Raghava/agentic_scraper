@@ -1,0 +1,34 @@
+# ── Core LLM ──────────────────────────────────────────────────────────────────
+openai>=1.30.0                  # GPT-4o API + embeddings
+
+# ── Web scraping ───────────────────────────────────────────────────────────────
+playwright>=1.44.0              # Anti-bot browser automation
+requests>=2.31.0                # HTTP fallback
+beautifulsoup4>=4.12.0          # HTML parsing
+lxml>=5.2.0                     # Fast HTML/XML parser (bs4 backend)
+ddgs>=6.1.0                     # DuckDuckGo search (no API key needed)
+
+# ── PDF & OCR ─────────────────────────────────────────────────────────────────
+pymupdf>=1.24.0                 # PyMuPDF (fitz) — fast PDF text + image extraction
+pdfplumber>=0.11.0              # Table-aware PDF extraction
+pdf2image>=1.17.0               # PDF → PIL images for OCR
+pytesseract>=0.3.10             # Tesseract OCR python wrapper
+opencv-python-headless>=4.9.0   # Image preprocessing for OCR
+numpy>=1.26.0                   # Array ops for image processing
+Pillow>=10.3.0                  # Image handling
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+pandas>=2.2.0                   # DataFrame output
+openpyxl>=3.1.0                 # XLSX export
+tabulate>=0.9.0                 # Pretty-print tables in terminal
+
+# ── UI / Console ──────────────────────────────────────────────────────────────
+rich>=13.7.0                    # Beautiful terminal output
+prompt_toolkit>=3.0.43          # Multi-line input, history, autocompletion
+
+# ── Config ────────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0            # .env loading
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tenacity>=8.3.0                 # Retry logic with exponential backoff
+httpx>=0.27.0                   # Async HTTP (used by openai internally)
