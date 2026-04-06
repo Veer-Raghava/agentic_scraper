@@ -33,12 +33,15 @@ Intent parsing:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
 from typing import Any
 
+from ddgs import DDGS
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 
 import config as cfg
 from agents.critic_agent import CriticAgent
@@ -117,12 +120,16 @@ from web sources about that topic.
 
 Requirements:
   - Columns must be directly relevant to the topic, not generic.
+  - Never change the domain (e.g. do not switch a biotech topic to gaming/startups).
   - Include a mix of: identity fields (name, ID, title), quantitative fields
     (numbers, dates, metrics), and qualitative fields (description, status, type).
   - Column names should be concise (2-4 words), title-cased.
   - Think about what a researcher or analyst would actually WANT in a spreadsheet.
   - Always include at least one identity column (something that uniquely identifies
     each entry) and at least one date/year column.
+  - If topic is about scientific/medical papers or molecules, prefer technical
+    columns over business/consumer columns.
+  - Put "Source URL" as the final column.
 
 Return ONLY a JSON array of column name strings.
 
@@ -168,6 +175,92 @@ class Orchestrator:
         # Track whether we've asked the user to confirm columns
         self._awaiting_column_confirmation = False
         self._pending_topic = ""
+        self._stage_order = ["Search", "Scrape", "Extract", "Critic", "Refine", "Export"]
+        self._stage_state = {s: ("pending", "") for s in self._stage_order}
+
+    def _live_status(self, message: str) -> None:
+        """Print a timestamped live status line in the CLI."""
+        console.print(f"[bold cyan]⏱[/bold cyan] [dim]{message}[/dim]")
+
+    def _render_pipeline_status(self) -> None:
+        """Render a compact status table for current pipeline state."""
+        icon = {
+            "pending": "○",
+            "running": "▶",
+            "done": "✓",
+            "failed": "✗",
+        }
+        table = Table(title="Pipeline Status", show_header=True, header_style="bold cyan")
+        table.add_column("Stage", style="bold")
+        table.add_column("State")
+        table.add_column("Details", overflow="fold")
+        for stage in self._stage_order:
+            state, details = self._stage_state.get(stage, ("pending", ""))
+            table.add_row(stage, f"{icon.get(state, '○')} {state}", details)
+        console.print(table)
+
+    def _set_stage(self, stage: str, state: str, details: str = "") -> None:
+        self._stage_state[stage] = (state, details)
+        self._render_pipeline_status()
+
+    def _run_step_with_timeout(self, fn, timeout_s: int, step_name: str):
+        """
+        Run a blocking step with a timeout to avoid long silent hangs.
+        Returns the function result or None if timed out/failed.
+        """
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(fn)
+                return future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            self._live_status(f"{step_name} timed out after {timeout_s}s")
+            return None
+        except Exception as exc:
+            self._live_status(f"{step_name} failed: {exc}")
+            return None
+
+    @staticmethod
+    def _topic_is_pdf_heavy(topic: str) -> bool:
+        """Best-effort heuristic to detect PDF/paper-heavy requests."""
+        t = (topic or "").lower()
+        signals = (
+            "pdf", "paper", "papers", "study", "studies", "journal",
+            "publication", "publications", "doi", "clinical trial", "review",
+        )
+        return any(s in t for s in signals)
+
+    def _fallback_pdf_search(self, topic: str, limit: int = 12) -> list[str]:
+        """
+        Fallback web search that prefers direct PDF links when primary search
+        returns nothing useful.
+        """
+        queries = [
+            f"{topic} filetype:pdf",
+            f"{topic} pdf",
+            f"{topic} research paper pdf",
+        ]
+        found: list[str] = []
+        seen: set[str] = set()
+        try:
+            with DDGS() as ddgs:
+                for q in queries:
+                    for r in ddgs.text(q, max_results=limit):
+                        url = str(r.get("href") or r.get("url") or "").strip()
+                        if not url or url in seen:
+                            continue
+                        is_pdf = (
+                            ".pdf" in url.lower()
+                            or "/pdf/" in url.lower()
+                            or "arxiv.org" in url.lower()
+                        )
+                        if is_pdf:
+                            seen.add(url)
+                            found.append(url)
+                        if len(found) >= limit:
+                            return found
+        except Exception as exc:
+            self._live_status(f"PDF fallback search failed: {exc}")
+        return found
 
     # ── Main entry point ────────────────────────────────────────────────────
 
@@ -199,6 +292,12 @@ class Orchestrator:
         # Parse intent
         intent = self._parse_intent(user_message)
 
+        # If we're waiting for column confirmation, prioritize that flow.
+        # This avoids LLM intent misclassification loops (e.g. "go" treated as
+        # a brand new topic instead of confirming suggested columns).
+        if self._awaiting_column_confirmation and self._should_force_column_confirm(user_message, intent):
+            intent = {"intent": "confirm_columns"}
+
         if cfg.DEBUG:
             console.print(f"[dim]Intent: {json.dumps(intent, indent=2)}[/dim]")
 
@@ -228,6 +327,31 @@ class Orchestrator:
         return response
 
     # ── Intent parsing ──────────────────────────────────────────────────────
+
+    def _should_force_column_confirm(self, message: str, intent: dict) -> bool:
+        """Return True when input should be treated as column confirmation."""
+        text = (message or "").strip().lower()
+        parsed_intent = (intent or {}).get("intent", "")
+
+        # Allow explicit control intents to pass through.
+        if parsed_intent in {"stop", "change_topic"}:
+            return False
+
+        # Strong confirmation signals.
+        if text in {"go", "yes", "ok", "all", "use all", "y"}:
+            return True
+        if re.match(r"^[\d,\s]+$", text):
+            return True
+        if text.startswith("use:") or text.startswith("use "):
+            return True
+        if text.startswith("add "):
+            return True
+
+        # In pending-confirmation mode, default to confirmation unless user is
+        # clearly asking for a new topic.
+        if any(phrase in text for phrase in ("new topic", "change topic", "start over", "different topic")):
+            return False
+        return True
 
     def _parse_intent(self, message: str) -> dict:
         """
@@ -360,6 +484,8 @@ class Orchestrator:
         Returns a summary message for the chat.
         """
         self.state.pipeline_running = True
+        self._live_status("Pipeline started")
+        self._stage_state = {s: ("pending", "") for s in self._stage_order}
         console.print(Panel.fit(
             f"[bold]Pipeline starting[/bold]\n"
             f"Topic: {self.state.topic}\n"
@@ -369,18 +495,55 @@ class Orchestrator:
         ))
 
         # 1. Search
-        self.search_agent.run(self.state)
+        self._live_status(f"Searching sources for topic: {self.state.topic}")
+        self._set_stage("Search", "running", f"Topic: {self.state.topic[:60]}")
+        search_result = self._run_step_with_timeout(
+            lambda: self.search_agent.run(self.state),
+            timeout_s=120,
+            step_name="Source search",
+        )
+        if search_result is None and not self.state.pending_sources:
+            self.state.pipeline_running = False
+            self._set_stage("Search", "failed", "Timed out or failed")
+            return (
+                "Search step timed out or failed. "
+                "Try 'limit 5', provide direct URLs, or retry."
+            )
+        self._live_status(f"Search finished. Pending sources: {len(self.state.pending_sources)}")
+        self._set_stage("Search", "done", f"Pending sources: {len(self.state.pending_sources)}")
+
+        # Fallback for PDF-heavy topics when no usable source was found.
+        if not self.state.pending_sources and self._topic_is_pdf_heavy(self.state.topic):
+            self._live_status("No sources yet. Running PDF-priority fallback search")
+            pdf_urls = self._fallback_pdf_search(self.state.topic, limit=max(8, self.state.source_limit))
+            for url in pdf_urls:
+                if url not in self.state.processed_sources and url not in self.state.dead_sources:
+                    self.state.pending_sources.append(url)
+            self._live_status(f"PDF fallback added {len(self.state.pending_sources)} source(s)")
+
         if not self.state.pending_sources:
             self.state.pipeline_running = False
+            self._live_status("No sources found. Pipeline stopped")
+            self._set_stage("Search", "failed", "No sources found")
             return (
                 "I couldn't find any sources for this topic. "
                 "Try rephrasing the topic or providing specific URLs."
             )
 
         # 2. Scrape
-        docs = self.scraper_agent.run(self.state, max_docs=self.state.source_limit)
+        self._live_status(f"Scraping up to {self.state.source_limit} source(s)")
+        self._set_stage("Scrape", "running", f"Limit: {self.state.source_limit}")
+        docs = self._run_step_with_timeout(
+            lambda: self.scraper_agent.run(self.state, max_docs=self.state.source_limit),
+            timeout_s=240,
+            step_name="Scraping",
+        ) or []
+        self._live_status(f"Scrape finished. Readable documents: {len(docs)}")
+        self._set_stage("Scrape", "done", f"Readable docs: {len(docs)}")
         if not docs:
             self.state.pipeline_running = False
+            self._live_status("No readable documents found. Pipeline stopped")
+            self._set_stage("Scrape", "failed", "No readable documents")
             return (
                 "I found URLs but couldn't extract readable content from them. "
                 "This often happens with heavily paywalled topics. "
@@ -388,19 +551,38 @@ class Orchestrator:
             )
 
         # 3. Extract
+        self._live_status(f"Extracting rows from {len(docs)} document(s)")
+        self._set_stage("Extract", "running", f"Documents: {len(docs)}")
         self.extractor_agent.run(docs, self.state)
+        self._live_status(f"Extraction finished. Rows collected: {len(self.state.rows)}")
+        self._set_stage("Extract", "done", f"Rows: {len(self.state.rows)}")
 
         # 4. Critic + Refine (if we have rows and haven't exceeded limits)
         if self.state.rows and self.state.refinement_rounds < cfg.MAX_REFINEMENT_ROUNDS:
+            self._live_status("Running critic pass")
+            self._set_stage("Critic", "running", f"Rows: {len(self.state.rows)}")
             assessments = self.critic_agent.run(self.state)
             if any(a.needs_refinement for a in assessments):
+                self._live_status("Refining missing/low-confidence fields")
+                self._set_stage("Critic", "done", "Needs refinement")
+                self._set_stage("Refine", "running", "Filling gaps")
                 self.refiner_agent.run(assessments, self.state)
+                self._live_status("Refinement finished")
+                self._set_stage("Refine", "done", "Gap fill completed")
+            else:
+                self._live_status("Critic finished. No refinement needed")
+                self._set_stage("Critic", "done", "No refinement needed")
+                self._set_stage("Refine", "done", "Skipped")
 
         # 5. Export
+        self._live_status("Saving CSV and rendering preview")
+        self._set_stage("Export", "running", "Writing CSV")
         csv_path = save_csv(self.state)
         print_preview(self.state)
+        self._set_stage("Export", "done", csv_path)
 
         self.state.pipeline_running = False
+        self._live_status("Pipeline completed")
 
         fill_rates = [r.fill_rate(self.state.columns) for r in self.state.rows]
         avg_fill   = sum(fill_rates) / len(fill_rates) if fill_rates else 0.0
@@ -472,18 +654,23 @@ class Orchestrator:
         extra = intent.get("source_limit") or 5
         console.print(f"[dim]Adding {extra} more sources…[/dim]")
 
+        self._live_status(f"Finding {extra} additional source(s)")
         self.search_agent.run(self.state)
         docs = self.scraper_agent.run(self.state, max_docs=extra)
+        self._live_status(f"Additional scrape finished. New docs: {len(docs)}")
 
         if not docs:
             return "Couldn't find additional sources. The topic may be well-covered already."
 
+        self._live_status("Extracting rows from additional sources")
         self.extractor_agent.run(docs, self.state)
         assessments = self.critic_agent.run(self.state)
         if any(a.needs_refinement for a in assessments):
+            self._live_status("Refining rows from additional sources")
             self.refiner_agent.run(assessments, self.state)
 
         csv_path = save_csv(self.state)
+        self._live_status("Additional source pass completed")
         return (
             f"Processed {len(docs)} more source(s). "
             f"Total rows: {len(self.state.rows)}. "
@@ -584,16 +771,21 @@ class Orchestrator:
             return "Please set a topic first before providing URLs."
 
         self.search_agent.add_custom_urls(urls, self.state)
+        self._live_status(f"Processing {len(urls)} custom URL(s)")
         docs = self.scraper_agent.run(self.state, max_docs=len(urls))
+        self._live_status(f"Custom URL scrape finished. Docs: {len(docs)}")
         if not docs:
             return "Couldn't extract content from those URLs."
 
+        self._live_status("Extracting rows from custom URLs")
         self.extractor_agent.run(docs, self.state)
         assessments = self.critic_agent.run(self.state)
         if any(a.needs_refinement for a in assessments):
+            self._live_status("Refining custom URL rows")
             self.refiner_agent.run(assessments, self.state)
 
         save_csv(self.state)
+        self._live_status("Custom URL run completed")
         return f"Processed {len(docs)} URL(s). {len(self.state.rows)} total rows."
 
     # ── Local PDFs ────────────────────────────────────────────────────────────
@@ -616,16 +808,21 @@ class Orchestrator:
             return "Please set a topic first."
 
         self.search_agent.add_local_pdfs(paths, self.state)
+        self._live_status(f"Processing {len(paths)} local PDF(s)")
         docs = self.scraper_agent.run(self.state, max_docs=len(paths))
+        self._live_status(f"Local PDF parse finished. Docs: {len(docs)}")
         if not docs:
             return "Couldn't extract content from those PDFs."
 
+        self._live_status("Extracting rows from local PDFs")
         self.extractor_agent.run(docs, self.state)
         assessments = self.critic_agent.run(self.state)
         if any(a.needs_refinement for a in assessments):
+            self._live_status("Refining local PDF rows")
             self.refiner_agent.run(assessments, self.state)
 
         save_csv(self.state)
+        self._live_status("Local PDF run completed")
         return f"Processed {len(docs)} PDF(s). {len(self.state.rows)} total rows."
 
     # ── Stop ──────────────────────────────────────────────────────────────────
@@ -679,10 +876,70 @@ class Orchestrator:
                 max_tokens=512,
             )
             if isinstance(raw, list):
-                return [str(x) for x in raw if isinstance(x, str) and x.strip()]
+                cleaned = self._clean_column_suggestions(
+                    topic,
+                    [str(x) for x in raw if isinstance(x, str) and x.strip()],
+                )
+                return cleaned
         except Exception as exc:
             console.print(f"[yellow]⚠ Column suggestion failed: {exc}[/yellow]")
         return []
+
+    def _clean_column_suggestions(self, topic: str, cols: list[str]) -> list[str]:
+        """Normalize/de-noise LLM suggestions and inject topic-aware defaults."""
+        def norm(name: str) -> str:
+            n = re.sub(r"\s+", " ", name).strip().title()
+            return n.replace("Url", "URL").replace("Doi", "DOI").replace("Dar", "DAR")
+
+        # Filter common off-topic noise we've seen in misfires.
+        blocked_tokens = {
+            "game", "player", "publisher", "download", "price", "startup",
+            "investor", "funding", "employee", "business model",
+        }
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for c in cols:
+            n = norm(c)
+            low = n.lower()
+            if any(tok in low for tok in blocked_tokens):
+                continue
+            if n.lower() in seen:
+                continue
+            seen.add(n.lower())
+            cleaned.append(n)
+
+        topic_low = (topic or "").lower()
+        if "antibody drug conjugate" in topic_low or re.search(r"\badc\b", topic_low):
+            preferred = [
+                "Antibody Name",
+                "Target Antigen",
+                "Linker",
+                "Payload",
+                "DAR",
+                "Indication",
+                "Approval Year",
+            ]
+            for p in reversed(preferred):
+                if p.lower() not in seen:
+                    cleaned.insert(0, p)
+                    seen.add(p.lower())
+
+        # Ensure identity and source columns exist.
+        if not any("name" in c.lower() or "title" in c.lower() for c in cleaned):
+            cleaned.insert(0, "Entity Name")
+        if "source url" not in [c.lower() for c in cleaned]:
+            cleaned.append("Source URL")
+
+        # Keep concise list.
+        cleaned = cleaned[:12]
+        if len(cleaned) < 8:
+            defaults = ["Type", "Status", "Evidence", "Reference Year"]
+            for d in defaults:
+                if d.lower() not in [c.lower() for c in cleaned]:
+                    cleaned.insert(-1, d)
+                if len(cleaned) >= 8:
+                    break
+        return cleaned
 
     def _finalise_columns(self, names: list[str]) -> list[ColumnDef]:
         """

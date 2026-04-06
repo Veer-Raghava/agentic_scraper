@@ -150,6 +150,7 @@ def run_chat_loop(orchestrator: Orchestrator, state: SessionState) -> None:
             # Get user input
             user_input = session.prompt(
                 [("class:prompt", "\nYou ❯ ")],
+                in_thread=True,
             ).strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Ctrl+C — type 'stop' to exit cleanly.[/dim]")
